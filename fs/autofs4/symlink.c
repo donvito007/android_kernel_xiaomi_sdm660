@@ -12,14 +12,16 @@
 
 #include "autofs_i.h"
 
-static int autofs4_follow_link(struct dentry *dentry, struct nameidata *nd)
+static const char *autofs4_follow_link(struct dentry *dentry, void **cookie)
 {
+	struct autofs_sb_info *sbi = autofs4_sbi(dentry->d_sb);
 	struct autofs_info *ino = autofs4_dentry_ino(dentry);
-	nd_set_link(nd, (char *)ino->u.symlink);
-	return 0;
+	if (ino && !autofs4_oz_mode(sbi))
+		ino->last_used = jiffies;
+	return d_inode(dentry)->i_private;
 }
 
-struct inode_operations autofs4_symlink_inode_operations = {
+const struct inode_operations autofs4_symlink_inode_operations = {
 	.readlink	= generic_readlink,
 	.follow_link	= autofs4_follow_link
 };

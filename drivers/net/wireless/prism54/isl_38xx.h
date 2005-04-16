@@ -1,5 +1,4 @@
 /*
- *  
  *  Copyright (C) 2002 Intersil Americas Inc.
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -12,15 +11,13 @@
  *  GNU General Public License for more details.
  *
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *  along with this program; if not, see <http://www.gnu.org/licenses/>.
  *
  */
 
 #ifndef _ISL_38XX_H
 #define _ISL_38XX_H
 
-#include <linux/version.h>
 #include <asm/io.h>
 #include <asm/byteorder.h>
 
@@ -68,10 +65,10 @@
  * @base: (host) memory base address of the device
  * @val: 32bit value (host order) to write
  * @offset: byte offset into @base to write value to
- * 
+ *
  *  This helper takes care of writing a 32bit datum to the
- *  specified offset into the device's pci memory space, and making sure 
- *  the pci memory buffers get flushed by performing one harmless read 
+ *  specified offset into the device's pci memory space, and making sure
+ *  the pci memory buffers get flushed by performing one harmless read
  *  from the %ISL38XX_PCI_POSTING_FLUSH offset.
  */
 static inline void
@@ -140,14 +137,14 @@ isl38xx_w32_flush(void __iomem *base, u32 val, unsigned long offset)
 #define MAX_FRAGMENT_SIZE_RX	                1600
 
 typedef struct {
-	u32 address;		/* physical address on host */
-	u16 size;		/* packet size */
-	u16 flags;		/* set of bit-wise flags */
+	__le32 address;		/* physical address on host */
+	__le16 size;		/* packet size */
+	__le16 flags;		/* set of bit-wise flags */
 } isl38xx_fragment;
 
 struct isl38xx_cb {
-	u32 driver_curr_frag[ISL38XX_CB_QCOUNT];
-	u32 device_curr_frag[ISL38XX_CB_QCOUNT];
+	__le32 driver_curr_frag[ISL38XX_CB_QCOUNT];
+	__le32 device_curr_frag[ISL38XX_CB_QCOUNT];
 	isl38xx_fragment rx_data_low[ISL38XX_CB_RX_QSIZE];
 	isl38xx_fragment tx_data_low[ISL38XX_CB_TX_QSIZE];
 	isl38xx_fragment rx_data_high[ISL38XX_CB_RX_QSIZE];

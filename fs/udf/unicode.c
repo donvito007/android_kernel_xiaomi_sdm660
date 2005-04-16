@@ -11,11 +11,6 @@
  *	UTF-8 is explained in the IETF RFC XXXX.
  *		ftp://ftp.internic.net/rfc/rfcxxxx.txt
  *
- * CONTACTS
- *	E-mail regarding any portion of the Linux UDF file system should be
- *	directed to the development team's mailing list (run by majordomo):
- *		linux_udf@hpesjro.fc.hp.com
- *
  * COPYRIGHT
  *	This file is distributed under the terms of the GNU General Public
  *	License (GPL). Copies of the GPL can be obtained from:
@@ -28,20 +23,24 @@
 #include <linux/kernel.h>
 #include <linux/string.h>	/* for memset */
 #include <linux/nls.h>
-#include <linux/udf_fs.h>
+#include <linux/crc-itu-t.h>
+#include <linux/slab.h>
 
 #include "udf_sb.h"
 
-static int udf_translate_to_linux(uint8_t *, uint8_t *, int, uint8_t *, int);
+static int udf_translate_to_linux(uint8_t *, int, uint8_t *, int, uint8_t *,
+				  int);
 
 static int udf_char_to_ustr(struct ustr *dest, const uint8_t *src, int strlen)
 {
-	if ( (!dest) || (!src) || (!strlen) || (strlen > UDF_NAME_LEN-2) )
+	if ((!dest) || (!src) || (!strlen) || (strlen > UDF_NAME_LEN - 2))
 		return 0;
+
 	memset(dest, 0, sizeof(struct ustr));
 	memcpy(dest->u_name, src, strlen);
 	dest->u_cmpID = 0x08;
 	dest->u_len = strlen;
+
 	return strlen;
 }
 
@@ -52,40 +51,36 @@ int udf_build_ustr(struct ustr *dest, dstring *ptr, int size)
 {
 	int usesize;
 
-	if ( (!dest) || (!ptr) || (!size) )
+	if (!dest || !ptr || !size)
 		return -1;
+	BUG_ON(size < 2);
 
-	memset(dest, 0, sizeof(struct ustr));
-	usesize= (size > UDF_NAME_LEN) ? UDF_NAME_LEN : size;
-	dest->u_cmpID=ptr[0];
-	dest->u_len=ptr[size-1];
-	memcpy(dest->u_name, ptr+1, usesize-1);
+	usesize = min_t(size_t, ptr[size - 1], sizeof(dest->u_name));
+	usesize = min(usesize, size - 2);
+	dest->u_cmpID = ptr[0];
+	dest->u_len = usesize;
+	memcpy(dest->u_name, ptr + 1, usesize);
+	memset(dest->u_name + usesize, 0, sizeof(dest->u_name) - usesize);
+
 	return 0;
 }
 
 /*
  * udf_build_ustr_exact
  */
-static int udf_build_ustr_exact(struct ustr *dest, dstring *ptr, int exactsize)
+static void udf_build_ustr_exact(struct ustr *dest, dstring *ptr, int exactsize)
 {
-	if ( (!dest) || (!ptr) || (!exactsize) )
-		return -1;
-
 	memset(dest, 0, sizeof(struct ustr));
-	dest->u_cmpID=ptr[0];
-	dest->u_len=exactsize-1;
-	memcpy(dest->u_name, ptr+1, exactsize-1);
-	return 0;
+	dest->u_cmpID = ptr[0];
+	dest->u_len = exactsize - 1;
+	memcpy(dest->u_name, ptr + 1, exactsize - 1);
 }
 
 /*
- * udf_ocu_to_utf8
+ * udf_CS0toUTF8
  *
  * PURPOSE
  *	Convert OSTA Compressed Unicode to the UTF-8 equivalent.
- *
- * DESCRIPTION
- *	This routine is only called by udf_filldir().
  *
  * PRE-CONDITIONS
  *	utf			Pointer to UTF-8 output buffer.
@@ -94,70 +89,71 @@ static int udf_build_ustr_exact(struct ustr *dest, dstring *ptr, int exactsize)
  * 				both of type "struct ustr *"
  *
  * POST-CONDITIONS
- *	<return>		Zero on success.
+ *	<return>		>= 0 on success.
  *
  * HISTORY
  *	November 12, 1997 - Andrew E. Mileski
  *	Written, tested, and released.
  */
-int udf_CS0toUTF8(struct ustr *utf_o, struct ustr *ocu_i)
+int udf_CS0toUTF8(struct ustr *utf_o, const struct ustr *ocu_i)
 {
-	uint8_t *ocu;
-	uint32_t c;
+	const uint8_t *ocu;
 	uint8_t cmp_id, ocu_len;
 	int i;
 
-	ocu = ocu_i->u_name;
-
 	ocu_len = ocu_i->u_len;
-	cmp_id = ocu_i->u_cmpID;
-	utf_o->u_len = 0;
-
-	if (ocu_len == 0)
-	{
+	if (ocu_len == 0) {
 		memset(utf_o, 0, sizeof(struct ustr));
-		utf_o->u_cmpID = 0;
-		utf_o->u_len = 0;
 		return 0;
 	}
 
-	if ((cmp_id != 8) && (cmp_id != 16))
-	{
-		printk(KERN_ERR "udf: unknown compression code (%d) stri=%s\n", cmp_id, ocu_i->u_name);
-		return 0;
+	cmp_id = ocu_i->u_cmpID;
+	if (cmp_id != 8 && cmp_id != 16) {
+		memset(utf_o, 0, sizeof(struct ustr));
+		pr_err("unknown compression code (%d) stri=%s\n",
+		       cmp_id, ocu_i->u_name);
+		return -EINVAL;
 	}
 
-	for (i = 0; (i < ocu_len) && (utf_o->u_len <= (UDF_NAME_LEN-3)) ;)
-	{
+	ocu = ocu_i->u_name;
+	utf_o->u_len = 0;
+	for (i = 0; (i < ocu_len) && (utf_o->u_len <= (UDF_NAME_LEN - 3));) {
 
 		/* Expand OSTA compressed Unicode to Unicode */
-		c = ocu[i++];
+		uint32_t c = ocu[i++];
 		if (cmp_id == 16)
 			c = (c << 8) | ocu[i++];
 
 		/* Compress Unicode to UTF-8 */
 		if (c < 0x80U)
 			utf_o->u_name[utf_o->u_len++] = (uint8_t)c;
-		else if (c < 0x800U)
-		{
-			utf_o->u_name[utf_o->u_len++] = (uint8_t)(0xc0 | (c >> 6));
-			utf_o->u_name[utf_o->u_len++] = (uint8_t)(0x80 | (c & 0x3f));
-		}
-		else
-		{
-			utf_o->u_name[utf_o->u_len++] = (uint8_t)(0xe0 | (c >> 12));
-			utf_o->u_name[utf_o->u_len++] = (uint8_t)(0x80 | ((c >> 6) & 0x3f));
-			utf_o->u_name[utf_o->u_len++] = (uint8_t)(0x80 | (c & 0x3f));
+		else if (c < 0x800U) {
+			if (utf_o->u_len > (UDF_NAME_LEN - 4))
+				break;
+			utf_o->u_name[utf_o->u_len++] =
+						(uint8_t)(0xc0 | (c >> 6));
+			utf_o->u_name[utf_o->u_len++] =
+						(uint8_t)(0x80 | (c & 0x3f));
+		} else {
+			if (utf_o->u_len > (UDF_NAME_LEN - 5))
+				break;
+			utf_o->u_name[utf_o->u_len++] =
+						(uint8_t)(0xe0 | (c >> 12));
+			utf_o->u_name[utf_o->u_len++] =
+						(uint8_t)(0x80 |
+							  ((c >> 6) & 0x3f));
+			utf_o->u_name[utf_o->u_len++] =
+						(uint8_t)(0x80 | (c & 0x3f));
 		}
 	}
-	utf_o->u_cmpID=8;
+	utf_o->u_cmpID = 8;
 
 	return utf_o->u_len;
 }
 
 /*
  *
- * udf_utf8_to_ocu
+ * udf_UTF8toCS0
  *
  * PURPOSE
  *	Convert UTF-8 to the OSTA Compressed Unicode equivalent.
@@ -181,164 +177,163 @@ int udf_CS0toUTF8(struct ustr *utf_o, struct ustr *ocu_i)
 static int udf_UTF8toCS0(dstring *ocu, struct ustr *utf, int length)
 {
 	unsigned c, i, max_val, utf_char;
-	int utf_cnt, u_len;
+	int utf_cnt, u_len, u_ch;
 
 	memset(ocu, 0, sizeof(dstring) * length);
 	ocu[0] = 8;
 	max_val = 0xffU;
+	u_ch = 1;
 
 try_again:
 	u_len = 0U;
 	utf_char = 0U;
 	utf_cnt = 0U;
-	for (i = 0U; i < utf->u_len; i++)
-	{
+	for (i = 0U; i < utf->u_len; i++) {
+		/* Name didn't fit? */
+		if (u_len + 1 + u_ch >= length)
+			return 0;
+
 		c = (uint8_t)utf->u_name[i];
 
 		/* Complete a multi-byte UTF-8 character */
-		if (utf_cnt)
-		{
+		if (utf_cnt) {
 			utf_char = (utf_char << 6) | (c & 0x3fU);
 			if (--utf_cnt)
 				continue;
-		}
-		else
-		{
+		} else {
 			/* Check for a multi-byte UTF-8 character */
-			if (c & 0x80U)
-			{
+			if (c & 0x80U) {
 				/* Start a multi-byte UTF-8 character */
-				if ((c & 0xe0U) == 0xc0U)
-				{
+				if ((c & 0xe0U) == 0xc0U) {
 					utf_char = c & 0x1fU;
 					utf_cnt = 1;
-				}
-				else if ((c & 0xf0U) == 0xe0U)
-				{
+				} else if ((c & 0xf0U) == 0xe0U) {
 					utf_char = c & 0x0fU;
 					utf_cnt = 2;
-				}
-				else if ((c & 0xf8U) == 0xf0U)
-				{
+				} else if ((c & 0xf8U) == 0xf0U) {
 					utf_char = c & 0x07U;
 					utf_cnt = 3;
-				}
-				else if ((c & 0xfcU) == 0xf8U)
-				{
+				} else if ((c & 0xfcU) == 0xf8U) {
 					utf_char = c & 0x03U;
 					utf_cnt = 4;
-				}
-				else if ((c & 0xfeU) == 0xfcU)
-				{
+				} else if ((c & 0xfeU) == 0xfcU) {
 					utf_char = c & 0x01U;
 					utf_cnt = 5;
-				}
-				else
+				} else {
 					goto error_out;
+				}
 				continue;
-			} else
+			} else {
 				/* Single byte UTF-8 character (most common) */
 				utf_char = c;
+			}
 		}
 
 		/* Choose no compression if necessary */
-		if (utf_char > max_val)
-		{
-			if ( 0xffU == max_val )
-			{
+		if (utf_char > max_val) {
+			if (max_val == 0xffU) {
 				max_val = 0xffffU;
 				ocu[0] = (uint8_t)0x10U;
+				u_ch = 2;
 				goto try_again;
 			}
 			goto error_out;
 		}
 
 		if (max_val == 0xffffU)
-		{
 			ocu[++u_len] = (uint8_t)(utf_char >> 8);
-		}
 		ocu[++u_len] = (uint8_t)(utf_char & 0xffU);
 	}
 
-
-	if (utf_cnt)
-	{
+	if (utf_cnt) {
 error_out:
 		ocu[++u_len] = '?';
-		printk(KERN_DEBUG "udf: bad UTF-8 character\n");
+		printk(KERN_DEBUG pr_fmt("bad UTF-8 character\n"));
 	}
 
 	ocu[length - 1] = (uint8_t)u_len + 1;
+
 	return u_len + 1;
 }
 
-static int udf_CS0toNLS(struct nls_table *nls, struct ustr *utf_o, struct ustr *ocu_i)
+static int udf_CS0toNLS(struct nls_table *nls, struct ustr *utf_o,
+			const struct ustr *ocu_i)
 {
-	uint8_t *ocu;
-	uint32_t c;
+	const uint8_t *ocu;
 	uint8_t cmp_id, ocu_len;
-	int i;
+	int i, len;
 
-	ocu = ocu_i->u_name;
 
 	ocu_len = ocu_i->u_len;
-	cmp_id = ocu_i->u_cmpID;
-	utf_o->u_len = 0;
-
-	if (ocu_len == 0)
-	{
+	if (ocu_len == 0) {
 		memset(utf_o, 0, sizeof(struct ustr));
-		utf_o->u_cmpID = 0;
-		utf_o->u_len = 0;
 		return 0;
 	}
 
-	if ((cmp_id != 8) && (cmp_id != 16))
-	{
-		printk(KERN_ERR "udf: unknown compression code (%d) stri=%s\n", cmp_id, ocu_i->u_name);
-		return 0;
+	cmp_id = ocu_i->u_cmpID;
+	if (cmp_id != 8 && cmp_id != 16) {
+		memset(utf_o, 0, sizeof(struct ustr));
+		pr_err("unknown compression code (%d) stri=%s\n",
+		       cmp_id, ocu_i->u_name);
+		return -EINVAL;
 	}
 
-	for (i = 0; (i < ocu_len) && (utf_o->u_len <= (UDF_NAME_LEN-3)) ;)
-	{
+	ocu = ocu_i->u_name;
+	utf_o->u_len = 0;
+	for (i = 0; (i < ocu_len) && (utf_o->u_len <= (UDF_NAME_LEN - 3));) {
 		/* Expand OSTA compressed Unicode to Unicode */
-		c = ocu[i++];
+		uint32_t c = ocu[i++];
 		if (cmp_id == 16)
 			c = (c << 8) | ocu[i++];
 
-		utf_o->u_len += nls->uni2char(c, &utf_o->u_name[utf_o->u_len], 
-			UDF_NAME_LEN - utf_o->u_len);
+		len = nls->uni2char(c, &utf_o->u_name[utf_o->u_len],
+				    UDF_NAME_LEN - 2 - utf_o->u_len);
+		/* Valid character? */
+		if (len >= 0)
+			utf_o->u_len += len;
+		else
+			utf_o->u_name[utf_o->u_len++] = '?';
 	}
-	utf_o->u_cmpID=8;
+	utf_o->u_cmpID = 8;
 
 	return utf_o->u_len;
 }
 
-static int udf_NLStoCS0(struct nls_table *nls, dstring *ocu, struct ustr *uni, int length)
+static int udf_NLStoCS0(struct nls_table *nls, dstring *ocu, struct ustr *uni,
+			int length)
 {
-	unsigned len, i, max_val;
+	int len;
+	unsigned i, max_val;
 	uint16_t uni_char;
-	int u_len;
+	int u_len, u_ch;
 
 	memset(ocu, 0, sizeof(dstring) * length);
 	ocu[0] = 8;
 	max_val = 0xffU;
+	u_ch = 1;
 
 try_again:
 	u_len = 0U;
-	for (i = 0U; i < uni->u_len; i++)
-	{
-		len = nls->char2uni(&uni->u_name[i], uni->u_len-i, &uni_char);
-		if (len <= 0)
+	for (i = 0U; i < uni->u_len; i++) {
+		/* Name didn't fit? */
+		if (u_len + 1 + u_ch >= length)
+			return 0;
+		len = nls->char2uni(&uni->u_name[i], uni->u_len - i, &uni_char);
+		if (!len)
 			continue;
+		/* Invalid character, deal with it */
+		if (len < 0) {
+			len = 1;
+			uni_char = '?';
+		}
 
-		if (uni_char > max_val)
-		{
+		if (uni_char > max_val) {
 			max_val = 0xffffU;
 			ocu[0] = (uint8_t)0x10U;
+			u_ch = 2;
 			goto try_again;
 		}
-		
+
 		if (max_val == 0xffffU)
 			ocu[++u_len] = (uint8_t)(uni_char >> 8);
 		ocu[++u_len] = (uint8_t)(uni_char & 0xffU);
@@ -349,168 +344,171 @@ try_again:
 	return u_len + 1;
 }
 
-int udf_get_filename(struct super_block *sb, uint8_t *sname, uint8_t *dname, int flen)
+int udf_get_filename(struct super_block *sb, uint8_t *sname, int slen,
+		     uint8_t *dname, int dlen)
 {
-	struct ustr filename, unifilename;
-	int len;
+	struct ustr *filename, *unifilename;
+	int ret;
 
-	if (udf_build_ustr_exact(&unifilename, sname, flen))
-	{
-		return 0;
+	if (!slen)
+		return -EIO;
+
+	filename = kmalloc(sizeof(struct ustr), GFP_NOFS);
+	if (!filename)
+		return -ENOMEM;
+
+	unifilename = kmalloc(sizeof(struct ustr), GFP_NOFS);
+	if (!unifilename) {
+		ret = -ENOMEM;
+		goto out1;
 	}
 
-	if (UDF_QUERY_FLAG(sb, UDF_FLAG_UTF8))
-	{
-		if (!udf_CS0toUTF8(&filename, &unifilename) )
-		{
-			udf_debug("Failed in udf_get_filename: sname = %s\n", sname);
-			return 0;
+	udf_build_ustr_exact(unifilename, sname, slen);
+	if (UDF_QUERY_FLAG(sb, UDF_FLAG_UTF8)) {
+		ret = udf_CS0toUTF8(filename, unifilename);
+		if (ret < 0) {
+			udf_debug("Failed in udf_get_filename: sname = %s\n",
+				  sname);
+			goto out2;
 		}
-	}
-	else if (UDF_QUERY_FLAG(sb, UDF_FLAG_NLS_MAP))
-	{
-		if (!udf_CS0toNLS(UDF_SB(sb)->s_nls_map, &filename, &unifilename) )
-		{
-			udf_debug("Failed in udf_get_filename: sname = %s\n", sname);
-			return 0;
+	} else if (UDF_QUERY_FLAG(sb, UDF_FLAG_NLS_MAP)) {
+		ret = udf_CS0toNLS(UDF_SB(sb)->s_nls_map, filename,
+				   unifilename);
+		if (ret < 0) {
+			udf_debug("Failed in udf_get_filename: sname = %s\n",
+				  sname);
+			goto out2;
 		}
-	}
-	else
-		return 0;
+	} else
+		BUG();
 
-	if ((len = udf_translate_to_linux(dname, filename.u_name, filename.u_len,
-		unifilename.u_name, unifilename.u_len)))
-	{
-		return len;
-	}
-	return 0;
+	ret = udf_translate_to_linux(dname, dlen,
+				     filename->u_name, filename->u_len,
+				     unifilename->u_name, unifilename->u_len);
+	/* Zero length filename isn't valid... */
+	if (ret == 0)
+		ret = -EINVAL;
+out2:
+	kfree(unifilename);
+out1:
+	kfree(filename);
+	return ret;
 }
 
-int udf_put_filename(struct super_block *sb, const uint8_t *sname, uint8_t *dname, int flen)
+int udf_put_filename(struct super_block *sb, const uint8_t *sname,
+		     uint8_t *dname, int flen)
 {
 	struct ustr unifilename;
 	int namelen;
 
-	if ( !(udf_char_to_ustr(&unifilename, sname, flen)) )
-	{
+	if (!udf_char_to_ustr(&unifilename, sname, flen))
 		return 0;
-	}
 
-	if (UDF_QUERY_FLAG(sb, UDF_FLAG_UTF8))
-	{
-		if ( !(namelen = udf_UTF8toCS0(dname, &unifilename, UDF_NAME_LEN)) )
-		{
+	if (UDF_QUERY_FLAG(sb, UDF_FLAG_UTF8)) {
+		namelen = udf_UTF8toCS0(dname, &unifilename, UDF_NAME_LEN);
+		if (!namelen)
 			return 0;
-		}
-	}
-	else if (UDF_QUERY_FLAG(sb, UDF_FLAG_NLS_MAP))
-	{
-		if ( !(namelen = udf_NLStoCS0(UDF_SB(sb)->s_nls_map, dname, &unifilename, UDF_NAME_LEN)) )
-		{
+	} else if (UDF_QUERY_FLAG(sb, UDF_FLAG_NLS_MAP)) {
+		namelen = udf_NLStoCS0(UDF_SB(sb)->s_nls_map, dname,
+					&unifilename, UDF_NAME_LEN);
+		if (!namelen)
 			return 0;
-		}
-	}
-	else
+	} else
 		return 0;
 
 	return namelen;
 }
 
 #define ILLEGAL_CHAR_MARK	'_'
-#define EXT_MARK			'.'
-#define CRC_MARK			'#'
-#define EXT_SIZE			5
+#define EXT_MARK		'.'
+#define CRC_MARK		'#'
+#define EXT_SIZE 		5
+/* Number of chars we need to store generated CRC to make filename unique */
+#define CRC_LEN			5
 
-static int udf_translate_to_linux(uint8_t *newName, uint8_t *udfName, int udfLen, uint8_t *fidName, int fidNameLen)
+static int udf_translate_to_linux(uint8_t *newName, int newLen,
+				  uint8_t *udfName, int udfLen,
+				  uint8_t *fidName, int fidNameLen)
 {
-	int index, newIndex = 0, needsCRC = 0;	
+	int index, newIndex = 0, needsCRC = 0;
 	int extIndex = 0, newExtIndex = 0, hasExt = 0;
 	unsigned short valueCRC;
 	uint8_t curr;
-	const uint8_t hexChar[] = "0123456789ABCDEF";
 
-	if (udfName[0] == '.' && (udfLen == 1 ||
-		(udfLen == 2 && udfName[1] == '.')))
-	{
+	if (udfName[0] == '.' &&
+	    (udfLen == 1 || (udfLen == 2 && udfName[1] == '.'))) {
 		needsCRC = 1;
 		newIndex = udfLen;
 		memcpy(newName, udfName, udfLen);
-	}
-	else
-	{	
-		for (index = 0; index < udfLen; index++)
-		{
+	} else {
+		for (index = 0; index < udfLen; index++) {
 			curr = udfName[index];
-			if (curr == '/' || curr == 0)
-			{
+			if (curr == '/' || curr == 0) {
 				needsCRC = 1;
 				curr = ILLEGAL_CHAR_MARK;
-				while (index+1 < udfLen && (udfName[index+1] == '/' ||
-					udfName[index+1] == 0))
+				while (index + 1 < udfLen &&
+						(udfName[index + 1] == '/' ||
+						 udfName[index + 1] == 0))
 					index++;
 			}
-			if (curr == EXT_MARK && (udfLen - index - 1) <= EXT_SIZE)
-			{
+			if (curr == EXT_MARK &&
+					(udfLen - index - 1) <= EXT_SIZE) {
 				if (udfLen == index + 1)
 					hasExt = 0;
-				else
-				{
+				else {
 					hasExt = 1;
 					extIndex = index;
 					newExtIndex = newIndex;
 				}
 			}
-			if (newIndex < 256)
+			if (newIndex < newLen)
 				newName[newIndex++] = curr;
 			else
 				needsCRC = 1;
 		}
 	}
-	if (needsCRC)
-	{
+	if (needsCRC) {
 		uint8_t ext[EXT_SIZE];
 		int localExtIndex = 0;
 
-		if (hasExt)
-		{
+		if (hasExt) {
 			int maxFilenameLen;
-			for(index = 0; index<EXT_SIZE && extIndex + index +1 < udfLen;
-				index++ )
-			{
+			for (index = 0;
+			     index < EXT_SIZE && extIndex + index + 1 < udfLen;
+			     index++) {
 				curr = udfName[extIndex + index + 1];
 
-				if (curr == '/' || curr == 0)
-				{
+				if (curr == '/' || curr == 0) {
 					needsCRC = 1;
 					curr = ILLEGAL_CHAR_MARK;
-					while(extIndex + index + 2 < udfLen && (index + 1 < EXT_SIZE
-						&& (udfName[extIndex + index + 2] == '/' ||
-							udfName[extIndex + index + 2] == 0)))
+					while (extIndex + index + 2 < udfLen &&
+					      (index + 1 < EXT_SIZE &&
+						(udfName[extIndex + index + 2] == '/' ||
+						 udfName[extIndex + index + 2] == 0)))
 						index++;
 				}
 				ext[localExtIndex++] = curr;
 			}
-			maxFilenameLen = 250 - localExtIndex;
+			maxFilenameLen = newLen - CRC_LEN - localExtIndex;
 			if (newIndex > maxFilenameLen)
 				newIndex = maxFilenameLen;
 			else
 				newIndex = newExtIndex;
-		}
-		else if (newIndex > 250)
-			newIndex = 250;
+		} else if (newIndex > newLen - CRC_LEN)
+			newIndex = newLen - CRC_LEN;
 		newName[newIndex++] = CRC_MARK;
-		valueCRC = udf_crc(fidName, fidNameLen, 0);
-		newName[newIndex++] = hexChar[(valueCRC & 0xf000) >> 12];
-		newName[newIndex++] = hexChar[(valueCRC & 0x0f00) >> 8];
-		newName[newIndex++] = hexChar[(valueCRC & 0x00f0) >> 4];
-		newName[newIndex++] = hexChar[(valueCRC & 0x000f)];
+		valueCRC = crc_itu_t(0, fidName, fidNameLen);
+		newName[newIndex++] = hex_asc_upper_hi(valueCRC >> 8);
+		newName[newIndex++] = hex_asc_upper_lo(valueCRC >> 8);
+		newName[newIndex++] = hex_asc_upper_hi(valueCRC);
+		newName[newIndex++] = hex_asc_upper_lo(valueCRC);
 
-		if (hasExt)
-		{
+		if (hasExt) {
 			newName[newIndex++] = EXT_MARK;
-			for (index = 0;index < localExtIndex ;index++ )
+			for (index = 0; index < localExtIndex; index++)
 				newName[newIndex++] = ext[index];
 		}
 	}
+
 	return newIndex;
 }

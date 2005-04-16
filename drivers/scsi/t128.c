@@ -1,4 +1,3 @@
-#define AUTOSENSE
 #define PSEUDO_DMA
 
 /*
@@ -12,8 +11,6 @@
  *	drew@colorado.edu
  *      +1 (303) 440-4894
  *
- * DISTRIBUTION RELEASE 3.
- *
  * For more information, please consult 
  *
  * Trantor Systems, Ltd.
@@ -24,40 +21,9 @@
  * 5415 Randall Place
  * Fremont, CA 94538
  * 1+ (415) 770-1400, FAX 1+ (415) 770-9910
- * 
- * and 
- *
- * NCR 5380 Family
- * SCSI Protocol Controller
- * Databook
- *
- * NCR Microelectronics
- * 1635 Aeroplaza Drive
- * Colorado Springs, CO 80916
- * 1+ (719) 578-3400
- * 1+ (800) 334-5454
  */
 
 /*
- * Options : 
- * AUTOSENSE - if defined, REQUEST SENSE will be performed automatically
- *      for commands that return with a CHECK CONDITION status. 
- *
- * PSEUDO_DMA - enables PSEUDO-DMA hardware, should give a 3-4X performance
- * increase compared to polled I/O.
- *
- * PARITY - enable parity checking.  Not supported.
- * 
- * SCSI2 - enable support for SCSI-II tagged queueing.  Untested.
- *
- *
- * UNSAFE - leave interrupts enabled during pseudo-DMA transfers.  You
- *          only really want to use this if you're having a problem with
- *          dropped characters during high speed communications, and even
- *          then, you're going to be better off twiddling with transfersize.
- *
- * USLEEP - enable support for devices that don't disconnect.  Untested.
- *
  * The card is detected and initialized in one of several ways : 
  * 1.  Autoprobe (default) - since the board is memory mapped, 
  *     a BIOS signature is scanned for to locate the registers.
@@ -102,14 +68,8 @@
  * 15 9-11
  */
  
-/*
- * $Log: t128.c,v $
- */
-
-#include <asm/system.h>
 #include <linux/signal.h>
-#include <linux/sched.h>
-#include <asm/io.h>
+#include <linux/io.h>
 #include <linux/blkdev.h>
 #include <linux/interrupt.h>
 #include <linux/stat.h>
@@ -117,7 +77,6 @@
 #include <linux/module.h>
 #include <linux/delay.h>
 
-#include "scsi.h"
 #include <scsi/scsi_host.h>
 #include "t128.h"
 #define AUTOPROBE_IRQ
@@ -126,15 +85,15 @@
 static struct override {
     unsigned long address;
     int irq;
-} overrides 
+} overrides
 #ifdef T128_OVERRIDE
     [] __initdata = T128_OVERRIDE;
 #else
-    [4] __initdata = {{0, IRQ_AUTO}, {0, IRQ_AUTO}, 
+    [4] __initdata = {{0, IRQ_AUTO}, {0, IRQ_AUTO},
         {0 ,IRQ_AUTO}, {0, IRQ_AUTO}};
 #endif
 
-#define NO_OVERRIDES (sizeof(overrides) / sizeof(struct override))
+#define NO_OVERRIDES ARRAY_SIZE(overrides)
 
 static struct base {
     unsigned int address;
@@ -143,7 +102,7 @@ static struct base {
     { 0xcc000, 0}, { 0xc8000, 0}, { 0xdc000, 0}, { 0xd8000, 0}
 };
 
-#define NO_BASES (sizeof (bases) / sizeof (struct base))
+#define NO_BASES ARRAY_SIZE(bases)
 
 static struct signature {
     const char *string;
@@ -152,8 +111,9 @@ static struct signature {
 {"TSROM: SCSI BIOS, Version 1.12", 0x36},
 };
 
-#define NO_SIGNATURES (sizeof (signatures) /  sizeof (struct signature))
+#define NO_SIGNATURES ARRAY_SIZE(signatures)
 
+#ifndef MODULE
 /*
  * Function : t128_setup(char *str, int *ints)
  *
@@ -164,9 +124,13 @@ static struct signature {
  *
  */
 
-void __init t128_setup(char *str, int *ints){
+static int __init t128_setup(char *str)
+{
     static int commandline_current = 0;
     int i;
+    int ints[10];
+
+    get_options(str, ARRAY_SIZE(ints), ints);
     if (ints[0] != 2) 
 	printk("t128_setup : usage t128=address,irq\n");
     else 
@@ -180,10 +144,14 @@ void __init t128_setup(char *str, int *ints){
 		}
 	    ++commandline_current;
 	}
+    return 1;
 }
 
+__setup("t128=", t128_setup);
+#endif
+
 /* 
- * Function : int t128_detect(Scsi_Host_Template * tpnt)
+ * Function : int t128_detect(struct scsi_host_template * tpnt)
  *
  * Purpose : detects and initializes T128,T128F, or T228 controllers
  *	that were autoprobed, overridden on the LILO command line, 
@@ -195,15 +163,13 @@ void __init t128_setup(char *str, int *ints){
  *
  */
 
-int __init t128_detect(Scsi_Host_Template * tpnt){
+static int __init t128_detect(struct scsi_host_template *tpnt)
+{
     static int current_override = 0, current_base = 0;
     struct Scsi_Host *instance;
     unsigned long base;
     void __iomem *p;
     int sig, count;
-
-    tpnt->proc_name = "t128";
-    tpnt->proc_info = &t128_proc_info;
 
     for (count = 0; current_override < NO_OVERRIDES; ++current_override) {
 	base = 0;
@@ -259,14 +225,19 @@ found:
 	else 
 	    instance->irq = NCR5380_probe_irq(instance, T128_IRQS);
 
-	if (instance->irq != SCSI_IRQ_NONE) 
-	    if (request_irq(instance->irq, t128_intr, SA_INTERRUPT, "t128", instance)) {
+	/* Compatibility with documented NCR5380 kernel parameters */
+	if (instance->irq == 255)
+		instance->irq = NO_IRQ;
+
+	if (instance->irq != NO_IRQ)
+	    if (request_irq(instance->irq, t128_intr, 0, "t128",
+			    instance)) {
 		printk("scsi%d : IRQ%d not free, interrupts disabled\n", 
 		    instance->host_no, instance->irq);
-		instance->irq = SCSI_IRQ_NONE;
+		instance->irq = NO_IRQ;
 	    } 
 
-	if (instance->irq == SCSI_IRQ_NONE) {
+	if (instance->irq == NO_IRQ) {
 	    printk("scsi%d : interrupts not enabled. for better interactive performance,\n", instance->host_no);
 	    printk("scsi%d : please jumper the board for a free IRQ.\n", instance->host_no);
 	}
@@ -274,16 +245,6 @@ found:
 #if defined(TDEBUG) && (TDEBUG & TDEBUG_INIT)
 	printk("scsi%d : irq = %d\n", instance->host_no, instance->irq);
 #endif
-
-	printk("scsi%d : at 0x%08lx", instance->host_no, instance->base);
-	if (instance->irq == SCSI_IRQ_NONE)
-	    printk (" interrupts disabled");
-	else 
-	    printk (" irq %d", instance->irq);
-	printk(" options CAN_QUEUE=%d  CMD_PER_LUN=%d release=%d",
-	    CAN_QUEUE, CMD_PER_LUN, T128_PUBLIC_RELEASE);
-	NCR5380_print_options(instance);
-	printk("\n");
 
 	++current_override;
 	++count;
@@ -295,8 +256,8 @@ static int t128_release(struct Scsi_Host *shost)
 {
 	NCR5380_local_declare();
 	NCR5380_setup(shost);
-	if (shost->irq)
-		free_irq(shost->irq, NULL);
+	if (shost->irq != NO_IRQ)
+		free_irq(shost->irq, shost);
 	NCR5380_exit(shost);
 	if (shost->io_port && shost->n_io_port)
 		release_region(shost->io_port, shost->n_io_port);
@@ -325,8 +286,8 @@ static int t128_release(struct Scsi_Host *shost)
  * and matching the H_C_S coordinates to what DOS uses.
  */
 
-int t128_biosparam(struct scsi_device *sdev, struct block_device *bdev,
-		sector_t capacity, int * ip)
+static int t128_biosparam(struct scsi_device *sdev, struct block_device *bdev,
+                          sector_t capacity, int *ip)
 {
   ip[0] = 64;
   ip[1] = 32;
@@ -430,15 +391,17 @@ MODULE_LICENSE("GPL");
 
 #include "NCR5380.c"
 
-static Scsi_Host_Template driver_template = {
+static struct scsi_host_template driver_template = {
 	.name           = "Trantor T128/T128F/T228",
 	.detect         = t128_detect,
 	.release        = t128_release,
+	.proc_name      = "t128",
+	.show_info      = t128_show_info,
+	.write_info     = t128_write_info,
+	.info           = t128_info,
 	.queuecommand   = t128_queue_command,
 	.eh_abort_handler = t128_abort,
 	.eh_bus_reset_handler    = t128_bus_reset,
-	.eh_host_reset_handler   = t128_host_reset,
-	.eh_device_reset_handler = t128_device_reset,
 	.bios_param     = t128_biosparam,
 	.can_queue      = CAN_QUEUE,
         .this_id        = 7,

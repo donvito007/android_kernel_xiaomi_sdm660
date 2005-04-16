@@ -7,54 +7,49 @@
  * magic northbridge registers..
  */
 
-#include <linux/sched.h>
 #include <linux/errno.h>
 #include <linux/pci.h>
-#include <linux/smp_lock.h>
 #include <linux/syscalls.h>
 #include <asm/uaccess.h>
+#include "pci.h"
 
-
-asmlinkage long
-sys_pciconfig_read(unsigned long bus, unsigned long dfn,
-		   unsigned long off, unsigned long len,
-		   void __user *buf)
+SYSCALL_DEFINE5(pciconfig_read, unsigned long, bus, unsigned long, dfn,
+		unsigned long, off, unsigned long, len, void __user *, buf)
 {
 	struct pci_dev *dev;
 	u8 byte;
 	u16 word;
 	u32 dword;
-	long err, cfg_ret;
+	long err;
+	int cfg_ret;
 
 	err = -EPERM;
+	dev = NULL;
 	if (!capable(CAP_SYS_ADMIN))
 		goto error;
 
 	err = -ENODEV;
-	dev = pci_find_slot(bus, dfn);
+	dev = pci_get_bus_and_slot(bus, dfn);
 	if (!dev)
 		goto error;
 
-	lock_kernel();
 	switch (len) {
 	case 1:
-		cfg_ret = pci_read_config_byte(dev, off, &byte);
+		cfg_ret = pci_user_read_config_byte(dev, off, &byte);
 		break;
 	case 2:
-		cfg_ret = pci_read_config_word(dev, off, &word);
+		cfg_ret = pci_user_read_config_word(dev, off, &word);
 		break;
 	case 4:
-		cfg_ret = pci_read_config_dword(dev, off, &dword);
+		cfg_ret = pci_user_read_config_dword(dev, off, &dword);
 		break;
 	default:
 		err = -EINVAL;
-		unlock_kernel();
 		goto error;
-	};
-	unlock_kernel();
+	}
 
 	err = -EIO;
-	if (cfg_ret != PCIBIOS_SUCCESSFUL)
+	if (cfg_ret)
 		goto error;
 
 	switch (len) {
@@ -67,7 +62,8 @@ sys_pciconfig_read(unsigned long bus, unsigned long dfn,
 	case 4:
 		err = put_user(dword, (unsigned int __user *)buf);
 		break;
-	};
+	}
+	pci_dev_put(dev);
 	return err;
 
 error:
@@ -84,14 +80,13 @@ error:
 	case 4:
 		put_user(-1, (unsigned int __user *)buf);
 		break;
-	};
+	}
+	pci_dev_put(dev);
 	return err;
 }
 
-asmlinkage long
-sys_pciconfig_write(unsigned long bus, unsigned long dfn,
-		    unsigned long off, unsigned long len,
-		    void __user *buf)
+SYSCALL_DEFINE5(pciconfig_write, unsigned long, bus, unsigned long, dfn,
+		unsigned long, off, unsigned long, len, void __user *, buf)
 {
 	struct pci_dev *dev;
 	u8 byte;
@@ -102,18 +97,17 @@ sys_pciconfig_write(unsigned long bus, unsigned long dfn,
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
-	dev = pci_find_slot(bus, dfn);
+	dev = pci_get_bus_and_slot(bus, dfn);
 	if (!dev)
 		return -ENODEV;
 
-	lock_kernel();
-	switch(len) {
+	switch (len) {
 	case 1:
 		err = get_user(byte, (u8 __user *)buf);
 		if (err)
 			break;
-		err = pci_write_config_byte(dev, off, byte);
-		if (err != PCIBIOS_SUCCESSFUL)
+		err = pci_user_write_config_byte(dev, off, byte);
+		if (err)
 			err = -EIO;
 		break;
 
@@ -121,8 +115,8 @@ sys_pciconfig_write(unsigned long bus, unsigned long dfn,
 		err = get_user(word, (u16 __user *)buf);
 		if (err)
 			break;
-		err = pci_write_config_word(dev, off, word);
-		if (err != PCIBIOS_SUCCESSFUL)
+		err = pci_user_write_config_word(dev, off, word);
+		if (err)
 			err = -EIO;
 		break;
 
@@ -130,16 +124,15 @@ sys_pciconfig_write(unsigned long bus, unsigned long dfn,
 		err = get_user(dword, (u32 __user *)buf);
 		if (err)
 			break;
-		err = pci_write_config_dword(dev, off, dword);
-		if (err != PCIBIOS_SUCCESSFUL)
+		err = pci_user_write_config_dword(dev, off, dword);
+		if (err)
 			err = -EIO;
 		break;
 
 	default:
 		err = -EINVAL;
 		break;
-	};
-	unlock_kernel();
-
+	}
+	pci_dev_put(dev);
 	return err;
 }

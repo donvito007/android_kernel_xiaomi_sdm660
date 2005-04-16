@@ -8,16 +8,19 @@
  * Copyright (C) 1996 by Ralf Baechle
  *
  * Multi-arch abstraction and asm macros for easier reading:
- * Copyright (C) 1996 David S. Miller (dm@engr.sgi.com)
+ * Copyright (C) 1996 David S. Miller (davem@davemloft.net)
  */
 #include <asm/asm.h>
 #include <asm/fpregdef.h>
 #include <asm/mipsregs.h>
-#include <asm/offset.h>
+#include <asm/asm-offsets.h>
 #include <asm/regdef.h>
 
 	.set	noreorder
 	.set	mips2
+	.set	push
+	SET_HARDFLOAT
+
 	/* Save floating point context */
 	LEAF(_save_fp_context)
 	mfc0	t0,CP0_STATUS
@@ -85,3 +88,5 @@
 1:	jr	ra
 	 nop
 	END(_restore_fp_context)
+
+	.set pop	/* SET_HARDFLOAT */

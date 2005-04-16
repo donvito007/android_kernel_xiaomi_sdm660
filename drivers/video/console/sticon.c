@@ -37,7 +37,6 @@
 
 #include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/tty.h>
 #include <linux/console.h>
 #include <linux/errno.h>
 #include <linux/vt_kern.h>
@@ -47,7 +46,7 @@
 
 #include <asm/io.h>
 
-#include "../sticore.h"
+#include "../fbdev/sticore.h"
 
 /* switching to graphics mode */
 #define BLANK 0
@@ -75,7 +74,7 @@ static inline void cursor_undrawn(void)
     cursor_drawn = 0;
 }
 
-static const char *__init sticon_startup(void)
+static const char *sticon_startup(void)
 {
     return "STI console";
 }
@@ -315,15 +314,15 @@ static unsigned long sticon_getxy(struct vc_data *conp, unsigned long pos,
 }
 
 static u8 sticon_build_attr(struct vc_data *conp, u8 color, u8 intens,
-			    u8 blink, u8 underline, u8 reverse)
+			    u8 blink, u8 underline, u8 reverse, u8 italic)
 {
-    u8 attr = ((color & 0x70) >> 1) | ((color & 7));
+	u8 fg = color & 7;
+	u8 bg = (color & 0x70) >> 4;
 
-    if (reverse) {
-	color = ((color >> 3) & 0x7) | ((color & 0x7) << 3);
-    }
-
-    return attr;
+	if (reverse)
+		return (fg << 3) | bg;
+	else
+		return (bg << 3) | fg;
 }
 
 static void sticon_invert_region(struct vc_data *conp, u16 *p, int count)
@@ -346,7 +345,7 @@ static void sticon_save_screen(struct vc_data *conp)
 {
 }
 
-static struct consw sti_con = {
+static const struct consw sti_con = {
 	.owner			= THIS_MODULE,
 	.con_startup		= sticon_startup,
 	.con_init		= sticon_init,
@@ -371,8 +370,9 @@ static struct consw sti_con = {
 
 
 
-int __init sticonsole_init(void)
+static int __init sticonsole_init(void)
 {
+    int err;
     /* already initialized ? */
     if (sticon_sti)
 	 return 0;
@@ -383,7 +383,10 @@ int __init sticonsole_init(void)
 
     if (conswitchp == &dummy_con) {
 	printk(KERN_INFO "sticon: Initializing STI text console.\n");
-	return take_over_console(&sti_con, 0, MAX_NR_CONSOLES - 1, 1);
+	console_lock();
+	err = do_take_over_console(&sti_con, 0, MAX_NR_CONSOLES - 1, 1);
+	console_unlock();
+	return err;
     }
     return 0;
 }

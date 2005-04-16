@@ -4,14 +4,16 @@
  *  Copyright (C) 1995  Linus Torvalds
  */
 
-#include <linux/module.h>
+#include <linux/stddef.h>
+#include <linux/kernel.h>
+#include <linux/export.h>
 #include <linux/time.h>
 #include <linux/mm.h>
 #include <linux/errno.h>
 #include <linux/stat.h>
 #include <linux/file.h>
-#include <linux/smp_lock.h>
 #include <linux/fs.h>
+#include <linux/fsnotify.h>
 #include <linux/dirent.h>
 #include <linux/security.h>
 #include <linux/syscalls.h>
@@ -19,29 +21,68 @@
 
 #include <asm/uaccess.h>
 
-int vfs_readdir(struct file *file, filldir_t filler, void *buf)
+int iterate_dir(struct file *file, struct dir_context *ctx)
 {
-	struct inode *inode = file->f_dentry->d_inode;
+	struct inode *inode = file_inode(file);
 	int res = -ENOTDIR;
-	if (!file->f_op || !file->f_op->readdir)
+	if (!file->f_op->iterate)
 		goto out;
 
 	res = security_file_permission(file, MAY_READ);
 	if (res)
 		goto out;
 
-	down(&inode->i_sem);
+	res = mutex_lock_killable(&inode->i_mutex);
+	if (res)
+		goto out;
+
 	res = -ENOENT;
 	if (!IS_DEADDIR(inode)) {
-		res = file->f_op->readdir(file, buf, filler);
+		ctx->pos = file->f_pos;
+		res = file->f_op->iterate(file, ctx);
+		file->f_pos = ctx->pos;
+		fsnotify_access(file);
 		file_accessed(file);
 	}
-	up(&inode->i_sem);
+	mutex_unlock(&inode->i_mutex);
 out:
 	return res;
 }
+EXPORT_SYMBOL(iterate_dir);
 
-EXPORT_SYMBOL(vfs_readdir);
+/*
+ * POSIX says that a dirent name cannot contain NULL or a '/'.
+ *
+ * It's not 100% clear what we should really do in this case.
+ * The filesystem is clearly corrupted, but returning a hard
+ * error means that you now don't see any of the other names
+ * either, so that isn't a perfect alternative.
+ *
+ * And if you return an error, what error do you use? Several
+ * filesystems seem to have decided on EUCLEAN being the error
+ * code for EFSCORRUPTED, and that may be the error to use. Or
+ * just EIO, which is perhaps more obvious to users.
+ *
+ * In order to see the other file names in the directory, the
+ * caller might want to make this a "soft" error: skip the
+ * entry, and return the error at the end instead.
+ *
+ * Note that this should likely do a "memchr(name, 0, len)"
+ * check too, since that would be filesystem corruption as
+ * well. However, that case can't actually confuse user space,
+ * which has to do a strlen() on the name anyway to find the
+ * filename length, and the above "soft error" worry means
+ * that it's probably better left alone until we have that
+ * issue clarified.
+ */
+static int verify_dirent_name(const char *name, int len)
+{
+	if (!len)
+		return -EIO;
+	if (memchr(name, '/', len))
+		return -EIO;
+	return 0;
+}
 
 /*
  * Traditional linux readdir() handling..
@@ -51,8 +92,6 @@ EXPORT_SYMBOL(vfs_readdir);
  * anyway. Thus the special "fillonedir()" function for that
  * case (the low-level handlers don't need to care about this).
  */
-#define NAME_OFFSET(de) ((int) ((de)->d_name - (char __user *) (de)))
-#define ROUND_UP(x) (((x)+sizeof(long)-1) & ~(sizeof(long)-1))
 
 #ifdef __ARCH_WANT_OLD_READDIR
 
@@ -64,25 +103,33 @@ struct old_linux_dirent {
 };
 
 struct readdir_callback {
+	struct dir_context ctx;
 	struct old_linux_dirent __user * dirent;
 	int result;
 };
 
-static int fillonedir(void * __buf, const char * name, int namlen, loff_t offset,
-		      ino_t ino, unsigned int d_type)
+static int fillonedir(struct dir_context *ctx, const char *name, int namlen,
+		      loff_t offset, u64 ino, unsigned int d_type)
 {
-	struct readdir_callback * buf = (struct readdir_callback *) __buf;
+	struct readdir_callback *buf =
+		container_of(ctx, struct readdir_callback, ctx);
 	struct old_linux_dirent __user * dirent;
+	unsigned long d_ino;
 
 	if (buf->result)
 		return -EINVAL;
+	d_ino = ino;
+	if (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {
+		buf->result = -EOVERFLOW;
+		return -EOVERFLOW;
+	}
 	buf->result++;
 	dirent = buf->dirent;
 	if (!access_ok(VERIFY_WRITE, dirent,
 			(unsigned long)(dirent->d_name + namlen + 1) -
 				(unsigned long)dirent))
 		goto efault;
-	if (	__put_user(ino, &dirent->d_ino) ||
+	if (	__put_user(d_ino, &dirent->d_ino) ||
 		__put_user(offset, &dirent->d_offset) ||
 		__put_user(namlen, &dirent->d_namlen) ||
 		__copy_to_user(dirent->d_name, name, namlen) ||
@@ -94,26 +141,24 @@ efault:
 	return -EFAULT;
 }
 
-asmlinkage long old_readdir(unsigned int fd, struct old_linux_dirent __user * dirent, unsigned int count)
+SYSCALL_DEFINE3(old_readdir, unsigned int, fd,
+		struct old_linux_dirent __user *, dirent, unsigned int, count)
 {
 	int error;
-	struct file * file;
-	struct readdir_callback buf;
+	struct fd f = fdget(fd);
+	struct readdir_callback buf = {
+		.ctx.actor = fillonedir,
+		.dirent = dirent
+	};
 
-	error = -EBADF;
-	file = fget(fd);
-	if (!file)
-		goto out;
+	if (!f.file)
+		return -EBADF;
 
-	buf.result = 0;
-	buf.dirent = dirent;
-
-	error = vfs_readdir(file, fillonedir, &buf);
-	if (error >= 0)
+	error = iterate_dir(f.file, &buf.ctx);
+	if (buf.result)
 		error = buf.result;
 
-	fput(file);
-out:
+	fdput(f);
 	return error;
 }
 
@@ -131,29 +176,41 @@ struct linux_dirent {
 };
 
 struct getdents_callback {
+	struct dir_context ctx;
 	struct linux_dirent __user * current_dir;
 	struct linux_dirent __user * previous;
 	int count;
 	int error;
 };
 
-static int filldir(void * __buf, const char * name, int namlen, loff_t offset,
-		   ino_t ino, unsigned int d_type)
+static int filldir(struct dir_context *ctx, const char *name, int namlen,
+		   loff_t offset, u64 ino, unsigned int d_type)
 {
 	struct linux_dirent __user * dirent;
-	struct getdents_callback * buf = (struct getdents_callback *) __buf;
-	int reclen = ROUND_UP(NAME_OFFSET(dirent) + namlen + 2);
+	struct getdents_callback *buf =
+		container_of(ctx, struct getdents_callback, ctx);
+	unsigned long d_ino;
+	int reclen = ALIGN(offsetof(struct linux_dirent, d_name) + namlen + 2,
+		sizeof(long));
 
+	buf->error = verify_dirent_name(name, namlen);
+	if (unlikely(buf->error))
+		return buf->error;
 	buf->error = -EINVAL;	/* only used if we fail.. */
 	if (reclen > buf->count)
 		return -EINVAL;
+	d_ino = ino;
+	if (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {
+		buf->error = -EOVERFLOW;
+		return -EOVERFLOW;
+	}
 	dirent = buf->previous;
 	if (dirent) {
 		if (__put_user(offset, &dirent->d_off))
 			goto efault;
 	}
 	dirent = buf->current_dir;
-	if (__put_user(ino, &dirent->d_ino))
+	if (__put_user(d_ino, &dirent->d_ino))
 		goto efault;
 	if (__put_user(reclen, &dirent->d_reclen))
 		goto efault;
@@ -173,61 +230,59 @@ efault:
 	return -EFAULT;
 }
 
-asmlinkage long sys_getdents(unsigned int fd, struct linux_dirent __user * dirent, unsigned int count)
+SYSCALL_DEFINE3(getdents, unsigned int, fd,
+		struct linux_dirent __user *, dirent, unsigned int, count)
 {
-	struct file * file;
+	struct fd f;
 	struct linux_dirent __user * lastdirent;
-	struct getdents_callback buf;
+	struct getdents_callback buf = {
+		.ctx.actor = filldir,
+		.count = count,
+		.current_dir = dirent
+	};
 	int error;
 
-	error = -EFAULT;
 	if (!access_ok(VERIFY_WRITE, dirent, count))
-		goto out;
+		return -EFAULT;
 
-	error = -EBADF;
-	file = fget(fd);
-	if (!file)
-		goto out;
+	f = fdget(fd);
+	if (!f.file)
+		return -EBADF;
 
-	buf.current_dir = dirent;
-	buf.previous = NULL;
-	buf.count = count;
-	buf.error = 0;
-
-	error = vfs_readdir(file, filldir, &buf);
-	if (error < 0)
-		goto out_putf;
-	error = buf.error;
+	error = iterate_dir(f.file, &buf.ctx);
+	if (error >= 0)
+		error = buf.error;
 	lastdirent = buf.previous;
 	if (lastdirent) {
-		if (put_user(file->f_pos, &lastdirent->d_off))
+		if (put_user(buf.ctx.pos, &lastdirent->d_off))
 			error = -EFAULT;
 		else
 			error = count - buf.count;
 	}
-
-out_putf:
-	fput(file);
-out:
+	fdput(f);
 	return error;
 }
 
-#define ROUND_UP64(x) (((x)+sizeof(u64)-1) & ~(sizeof(u64)-1))
-
 struct getdents_callback64 {
+	struct dir_context ctx;
 	struct linux_dirent64 __user * current_dir;
 	struct linux_dirent64 __user * previous;
 	int count;
 	int error;
 };
 
-static int filldir64(void * __buf, const char * name, int namlen, loff_t offset,
-		     ino_t ino, unsigned int d_type)
+static int filldir64(struct dir_context *ctx, const char *name, int namlen,
+		     loff_t offset, u64 ino, unsigned int d_type)
 {
 	struct linux_dirent64 __user *dirent;
-	struct getdents_callback64 * buf = (struct getdents_callback64 *) __buf;
-	int reclen = ROUND_UP64(NAME_OFFSET(dirent) + namlen + 1);
+	struct getdents_callback64 *buf =
+		container_of(ctx, struct getdents_callback64, ctx);
+	int reclen = ALIGN(offsetof(struct linux_dirent64, d_name) + namlen + 1,
+		sizeof(u64));
 
+	buf->error = verify_dirent_name(name, namlen);
+	if (unlikely(buf->error))
+		return buf->error;
 	buf->error = -EINVAL;	/* only used if we fail.. */
 	if (reclen > buf->count)
 		return -EINVAL;
@@ -259,42 +314,36 @@ efault:
 	return -EFAULT;
 }
 
-asmlinkage long sys_getdents64(unsigned int fd, struct linux_dirent64 __user * dirent, unsigned int count)
+SYSCALL_DEFINE3(getdents64, unsigned int, fd,
+		struct linux_dirent64 __user *, dirent, unsigned int, count)
 {
-	struct file * file;
+	struct fd f;
 	struct linux_dirent64 __user * lastdirent;
-	struct getdents_callback64 buf;
+	struct getdents_callback64 buf = {
+		.ctx.actor = filldir64,
+		.count = count,
+		.current_dir = dirent
+	};
 	int error;
 
-	error = -EFAULT;
 	if (!access_ok(VERIFY_WRITE, dirent, count))
-		goto out;
+		return -EFAULT;
 
-	error = -EBADF;
-	file = fget(fd);
-	if (!file)
-		goto out;
+	f = fdget(fd);
+	if (!f.file)
+		return -EBADF;
 
-	buf.current_dir = dirent;
-	buf.previous = NULL;
-	buf.count = count;
-	buf.error = 0;
-
-	error = vfs_readdir(file, filldir64, &buf);
-	if (error < 0)
-		goto out_putf;
-	error = buf.error;
+	error = iterate_dir(f.file, &buf.ctx);
+	if (error >= 0)
+		error = buf.error;
 	lastdirent = buf.previous;
 	if (lastdirent) {
-		typeof(lastdirent->d_off) d_off = file->f_pos;
-		error = -EFAULT;
+		typeof(lastdirent->d_off) d_off = buf.ctx.pos;
 		if (__put_user(d_off, &lastdirent->d_off))
-			goto out_putf;
-		error = count - buf.count;
+			error = -EFAULT;
+		else
+			error = count - buf.count;
 	}
-
-out_putf:
-	fput(file);
-out:
+	fdput(f);
 	return error;
 }

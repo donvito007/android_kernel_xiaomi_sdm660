@@ -36,7 +36,6 @@
 #include <linux/highmem.h>
 #include <linux/kernel.h>
 #include <linux/pagemap.h>
-#include <linux/smp_lock.h>
 
 #include "vxfs.h"
 #include "vxfs_dir.h"
@@ -49,25 +48,20 @@
 #define VXFS_BLOCK_PER_PAGE(sbp)  ((PAGE_CACHE_SIZE / (sbp)->s_blocksize))
 
 
-static struct dentry *	vxfs_lookup(struct inode *, struct dentry *, struct nameidata *);
-static int		vxfs_readdir(struct file *, void *, filldir_t);
+static struct dentry *	vxfs_lookup(struct inode *, struct dentry *, unsigned int);
+static int		vxfs_readdir(struct file *, struct dir_context *);
 
-struct inode_operations vxfs_dir_inode_ops = {
+const struct inode_operations vxfs_dir_inode_ops = {
 	.lookup =		vxfs_lookup,
 };
 
-struct file_operations vxfs_dir_operations = {
-	.readdir =		vxfs_readdir,
+const struct file_operations vxfs_dir_operations = {
+	.llseek =		generic_file_llseek,
+	.read =			generic_read_dir,
+	.iterate =		vxfs_readdir,
 };
 
- 
-static __inline__ u_long
-dir_pages(struct inode *inode)
-{
-	return (inode->i_size + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
-}
- 
-static __inline__ u_long
+static inline u_long
 dir_blocks(struct inode *ip)
 {
 	u_long			bsize = ip->i_sb->s_blocksize;
@@ -79,7 +73,7 @@ dir_blocks(struct inode *ip)
  *
  * len <= VXFS_NAMELEN and de != NULL are guaranteed by caller.
  */
-static __inline__ int
+static inline int
 vxfs_match(int len, const char * const name, struct vxfs_direct *de)
 {
 	if (len != de->d_namelen)
@@ -89,7 +83,7 @@ vxfs_match(int len, const char * const name, struct vxfs_direct *de)
 	return !memcmp(name, de->d_name, len);
 }
 
-static __inline__ struct vxfs_direct *
+static inline struct vxfs_direct *
 vxfs_next_entry(struct vxfs_direct *de)
 {
 	return ((struct vxfs_direct *)((char*)de + de->d_reclen));
@@ -161,7 +155,7 @@ vxfs_find_entry(struct inode *ip, struct dentry *dp, struct page **ppp)
 /**
  * vxfs_inode_by_name - find inode number for dentry
  * @dip:	directory to search in
- * @dp:		dentry we seach for
+ * @dp:		dentry we search for
  *
  * Description:
  *   vxfs_inode_by_name finds out the inode number of
@@ -191,18 +185,18 @@ vxfs_inode_by_name(struct inode *dip, struct dentry *dp)
  * vxfs_lookup - lookup pathname component
  * @dip:	dir in which we lookup
  * @dp:		dentry we lookup
- * @nd:		lookup nameidata
+ * @flags:	lookup flags
  *
  * Description:
  *   vxfs_lookup tries to lookup the pathname component described
  *   by @dp in @dip.
  *
  * Returns:
- *   A NULL-pointer on success, else an negative error code encoded
+ *   A NULL-pointer on success, else a negative error code encoded
  *   in the return pointer.
  */
 static struct dentry *
-vxfs_lookup(struct inode *dip, struct dentry *dp, struct nameidata *nd)
+vxfs_lookup(struct inode *dip, struct dentry *dp, unsigned int flags)
 {
 	struct inode		*ip = NULL;
 	ino_t			ino;
@@ -210,16 +204,12 @@ vxfs_lookup(struct inode *dip, struct dentry *dp, struct nameidata *nd)
 	if (dp->d_name.len > VXFS_NAMELEN)
 		return ERR_PTR(-ENAMETOOLONG);
 				 
-	lock_kernel();
 	ino = vxfs_inode_by_name(dip, dp);
 	if (ino) {
-		ip = iget(dip->i_sb, ino);
-		if (!ip) {
-			unlock_kernel();
-			return ERR_PTR(-EACCES);
-		}
+		ip = vxfs_iget(dip->i_sb, ino);
+		if (IS_ERR(ip))
+			return ERR_CAST(ip);
 	}
-	unlock_kernel();
 	d_add(dp, ip);
 	return NULL;
 }
@@ -238,33 +228,28 @@ vxfs_lookup(struct inode *dip, struct dentry *dp, struct nameidata *nd)
  *   Zero.
  */
 static int
-vxfs_readdir(struct file *fp, void *retp, filldir_t filler)
+vxfs_readdir(struct file *fp, struct dir_context *ctx)
 {
-	struct inode		*ip = fp->f_dentry->d_inode;
+	struct inode		*ip = file_inode(fp);
 	struct super_block	*sbp = ip->i_sb;
 	u_long			bsize = sbp->s_blocksize;
 	u_long			page, npages, block, pblocks, nblocks, offset;
 	loff_t			pos;
 
-	switch ((long)fp->f_pos) {
-	case 0:
-		if (filler(retp, ".", 1, fp->f_pos, ip->i_ino, DT_DIR) < 0)
-			goto out;
-		fp->f_pos++;
-		/* fallthrough */
-	case 1:
-		if (filler(retp, "..", 2, fp->f_pos, VXFS_INO(ip)->vii_dotdot, DT_DIR) < 0)
-			goto out;
-		fp->f_pos++;
-		/* fallthrough */
+	if (ctx->pos == 0) {
+		if (!dir_emit_dot(fp, ctx))
+			return 0;
+		ctx->pos = 1;
 	}
-
-	pos = fp->f_pos - 2;
+	if (ctx->pos == 1) {
+		if (!dir_emit(ctx, "..", 2, VXFS_INO(ip)->vii_dotdot, DT_DIR))
+			return 0;
+		ctx->pos = 2;
+	}
+	pos = ctx->pos - 2;
 	
-	if (pos > VXFS_DIRROUND(ip->i_size)) {
-		unlock_kernel();
+	if (pos > VXFS_DIRROUND(ip->i_size))
 		return 0;
-	}
 
 	npages = dir_pages(ip);
 	nblocks = dir_blocks(ip);
@@ -275,16 +260,16 @@ vxfs_readdir(struct file *fp, void *retp, filldir_t filler)
 	block = (u_long)(pos >> sbp->s_blocksize_bits) % pblocks;
 
 	for (; page < npages; page++, block = 0) {
-		caddr_t			kaddr;
+		char			*kaddr;
 		struct page		*pp;
 
 		pp = vxfs_get_page(ip->i_mapping, page);
 		if (IS_ERR(pp))
 			continue;
-		kaddr = (caddr_t)page_address(pp);
+		kaddr = (char *)page_address(pp);
 
 		for (; block <= nblocks && block <= pblocks; block++) {
-			caddr_t			baddr, limit;
+			char			*baddr, *limit;
 			struct vxfs_dirblk	*dbp;
 			struct vxfs_direct	*de;
 
@@ -297,21 +282,18 @@ vxfs_readdir(struct file *fp, void *retp, filldir_t filler)
 				 (kaddr + offset) :
 				 (baddr + VXFS_DIRBLKOV(dbp)));
 
-			for (; (caddr_t)de <= limit; de = vxfs_next_entry(de)) {
-				int	over;
-
+			for (; (char *)de <= limit; de = vxfs_next_entry(de)) {
 				if (!de->d_reclen)
 					break;
 				if (!de->d_ino)
 					continue;
 
-				offset = (caddr_t)de - kaddr;
-				over = filler(retp, de->d_name, de->d_namelen,
-					((page << PAGE_CACHE_SHIFT) | offset) + 2,
-					de->d_ino, DT_UNKNOWN);
-				if (over) {
+				offset = (char *)de - kaddr;
+				ctx->pos = ((page << PAGE_CACHE_SHIFT) | offset) + 2;
+				if (!dir_emit(ctx, de->d_name, de->d_namelen,
+					de->d_ino, DT_UNKNOWN)) {
 					vxfs_put_page(pp);
-					goto done;
+					return 0;
 				}
 			}
 			offset = 0;
@@ -319,10 +301,6 @@ vxfs_readdir(struct file *fp, void *retp, filldir_t filler)
 		vxfs_put_page(pp);
 		offset = 0;
 	}
-
-done:
-	fp->f_pos = ((page << PAGE_CACHE_SHIFT) | offset) + 2;
-out:
-	unlock_kernel();
+	ctx->pos = ((page << PAGE_CACHE_SHIFT) | offset) + 2;
 	return 0;
 }
