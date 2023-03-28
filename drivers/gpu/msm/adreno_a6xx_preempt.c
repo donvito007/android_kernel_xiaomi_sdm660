@@ -782,12 +782,9 @@ int a6xx_preemption_init(struct adreno_device *adreno_dev)
 
 	timer_setup(&preempt->timer, _a6xx_preemption_timer, 0);
 
-<<<<<<< HEAD
-=======
 	ret = kgsl_allocate_global(device, &preempt->scratch, PAGE_SIZE, 0,
 			flags, "preemption_scratch");
 
->>>>>>> LA.UM.11.2.1.r1-03900-sdm660.0
 	/* Allocate mem for storing preemption switch record */
 	FOR_EACH_RINGBUFFER(adreno_dev, rb, i) {
 		ret = a6xx_preemption_ringbuffer_init(adreno_dev, rb);
@@ -803,13 +800,8 @@ int a6xx_preemption_init(struct adreno_device *adreno_dev)
 	 * access it.
 	 */
 	if (!adreno_dev->perfcounter) {
-<<<<<<< HEAD
-		u32 *postamble = preempt->counters.hostptr +
-					(KMD_POSTAMBLE_IDX * sizeof(u64));
-=======
 		u32 *postamble = device->scratch.hostptr +
 				SCRATCH_POSTAMBLE_OFFSET;
->>>>>>> LA.UM.11.2.1.r1-03900-sdm660.0
 		u32 count = 0;
 
 		postamble[count++] = cp_type7_packet(CP_REG_RMW, 3);

@@ -3834,10 +3834,9 @@ static vm_fault_t do_fault_around(struct vm_fault *vmf)
 	end_pgoff = min3(end_pgoff, vma_pages(vmf->vma) + vmf->vma->vm_pgoff - 1,
 			start_pgoff + nr_pages - 1);
 
-	if (!(vmf->flags & FAULT_FLAG_SPECULATIVE) &&
-	    pmd_none(*vmf->pmd)) {
-		vmf->prealloc_pte = pte_alloc_one(vmf->vma->vm_mm,
-						  vmf->address);
+	if (pmd_none(*vmf->pmd)) {
+			vmf->prealloc_pte = pte_alloc_one(vmf->vma->vm_mm);
+		
 		if (!vmf->prealloc_pte)
 			goto out;
 		smp_wmb(); /* See comment in __pte_alloc() */
