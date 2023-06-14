@@ -782,8 +782,10 @@ int a6xx_preemption_init(struct adreno_device *adreno_dev)
 
 	timer_setup(&preempt->timer, _a6xx_preemption_timer, 0);
 
-	ret = kgsl_allocate_global(device, &preempt->scratch, PAGE_SIZE, 0,
+	/*
+		ret = kgsl_allocate_global(device, &preempt->scratch, PAGE_SIZE, 0,
 			flags, "preemption_scratch");
+	*/
 
 	/* Allocate mem for storing preemption switch record */
 	FOR_EACH_RINGBUFFER(adreno_dev, rb, i) {
