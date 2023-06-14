@@ -546,6 +546,7 @@ static inline int dvb_dmx_swfilter_payload(struct dvb_demux_feed *feed,
 		feed->pes_cont_err_counter = 0;
 		feed->pes_ts_packets_num = 0;
 	}
+	feed->cc = cc;
 
 	if (feed->pusi_seen == 0)
 		return 0;
@@ -761,16 +762,7 @@ static int dvb_dmx_swfilter_section_one_packet(struct dvb_demux_feed *feed,
 	p = 188 - count;	/* payload start */
 
 	cc = buf[3] & 0x0f;
-	if (feed->first_cc)
-		ccok = 1;
-	else
-		ccok = ((feed->cc + 1) & 0x0f) == cc;
-
-	/* discard TS packets holding sections with TEI bit set */
-	if (buf[1] & 0x80)
-		return -EINVAL;
-
-	feed->first_cc = 0;
+	ccok = ((feed->cc + 1) & 0x0f) == cc;
 	feed->cc = cc;
 
 	if (buf[3] & 0x20) {
@@ -797,6 +789,7 @@ static int dvb_dmx_swfilter_section_one_packet(struct dvb_demux_feed *feed,
 		feed->pusi_seen = 0;
 		dvb_dmx_swfilter_section_new(feed);
 	}
+	feed->cc = cc;
 
 	if (buf[1] & 0x40) {
 		/* PUSI=1 (is set), section boundary is here */
