@@ -245,7 +245,7 @@ static void rcu_report_exp_cpu_mult(struct rcu_node *rnp,
 		if (!IS_ENABLED(CONFIG_NO_HZ_FULL) || !rdp->rcu_forced_tick_exp)
 			continue;
 		rdp->rcu_forced_tick_exp = false;
-		tick_dep_clear_cpu(cpu, TICK_DEP_BIT_RCU_EXP);
+		tick_dep_clear_cpu(cpu, TICK_DEP_BIT_RCU);
 	}
 	__rcu_report_exp_rnp(rnp, wake, flags); /* Releases rnp->lock. */
 }
@@ -604,7 +604,7 @@ static void synchronize_rcu_expedited_wait(void)
 				if (rdp->rcu_forced_tick_exp)
 					continue;
 				rdp->rcu_forced_tick_exp = true;
-				tick_dep_set_cpu(cpu, TICK_DEP_BIT_RCU_EXP);
+				tick_dep_set_cpu(cpu, TICK_DEP_BIT_RCU);
 			}
 		}
 		j = READ_ONCE(jiffies_till_first_fqs);
